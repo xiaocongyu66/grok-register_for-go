@@ -18,20 +18,16 @@ type EmailHandle struct {
 	ID       string
 }
 
-var moemailAPI = ""
-var moemailKey = ""
-var moemailDomain = ""
-
-func init() {
-	if v := envFirst("MOEMAIL_API"); v != "" {
-		moemailAPI = strings.TrimRight(v, "/")
-	}
-	if v := envFirst("MOEMAIL_API_KEY"); v != "" {
-		moemailKey = v
-	}
-	if v := envFirst("MOEMAIL_DOMAIN"); v != "" {
-		moemailDomain = v
-	}
+// moemail 配置用 lazy 读取(因为 init() 在 loadEnvFile 之前执行)。
+// 每次调用时从环境变量读,确保 .env 已加载。
+func moemailAPI() string {
+	return strings.TrimRight(envFirst("MOEMAIL_API"), "/")
+}
+func moemailKey() string {
+	return envFirst("MOEMAIL_API_KEY")
+}
+func moemailDomain() string {
+	return envFirst("MOEMAIL_DOMAIN")
 }
 
 var noProxyClient = &http.Client{
@@ -44,12 +40,12 @@ func CreateMailbox() (*EmailHandle, error) {
 	name := "oc" + randomHex(4)
 	payload, _ := json.Marshal(map[string]any{
 		"name":       name,
-		"domain":     moemailDomain,
+		"domain":     moemailDomain(),
 		"expiryTime": 3600000,
 	})
 
-	req, _ := http.NewRequest("POST", moemailAPI+"/api/emails/generate", strings.NewReader(string(payload)))
-	req.Header.Set("X-API-Key", moemailKey)
+	req, _ := http.NewRequest("POST", moemailAPI()+"/api/emails/generate", strings.NewReader(string(payload)))
+	req.Header.Set("X-API-Key", moemailKey())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
@@ -92,8 +88,8 @@ func CreateMailbox() (*EmailHandle, error) {
 func PollEmailCode(handle string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		req, _ := http.NewRequest("GET", moemailAPI+"/api/emails/"+handle, nil)
-		req.Header.Set("X-API-Key", moemailKey)
+		req, _ := http.NewRequest("GET", moemailAPI()+"/api/emails/"+handle, nil)
+		req.Header.Set("X-API-Key", moemailKey())
 		req.Header.Set("Accept", "application/json")
 		resp, err := noProxyClient.Do(req)
 		if err == nil {
