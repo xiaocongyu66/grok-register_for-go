@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -109,7 +110,9 @@ func (m *proxyRelayManager) startRelay(upstream string) *relayResult {
 	localURL := fmt.Sprintf("socks5://%s", listen)
 
 	cmd := exec.Command(bin, "--listen", listen, "--upstream", upstream)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if runtime.GOOS != "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 	logDir := filepath.Join(ProjectRoot(), "logs", "proxy-relay")
 	os.MkdirAll(logDir, 0755)
 	logPath := filepath.Join(logDir, fmt.Sprintf("relay-%d.log", port))
