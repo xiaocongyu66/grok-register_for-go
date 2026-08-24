@@ -6,10 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -110,9 +108,7 @@ func (m *proxyRelayManager) startRelay(upstream string) *relayResult {
 	localURL := fmt.Sprintf("socks5://%s", listen)
 
 	cmd := exec.Command(bin, "--listen", listen, "--upstream", upstream)
-	if runtime.GOOS != "windows" {
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	}
+	setSysProcAttr(cmd)
 	logDir := filepath.Join(ProjectRoot(), "logs", "proxy-relay")
 	os.MkdirAll(logDir, 0755)
 	logPath := filepath.Join(logDir, fmt.Sprintf("relay-%d.log", port))
@@ -179,7 +175,7 @@ func relayAlive(r *relayProc) bool {
 	if r == nil || r.cmd == nil || r.cmd.Process == nil {
 		return false
 	}
-	return r.cmd.Process.Signal(syscall.Signal(0)) == nil
+	return processAlive(r.cmd.Process)
 }
 
 func waitPortReady(host string, port int, timeout time.Duration) bool {
