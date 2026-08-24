@@ -1,0 +1,17 @@
+*.exe
+*.dll
+*.so
+*.dylib
+/grok
+/minirelay
+/socks5relay
+proxytest
+turnstile-server
+vendor/
+
+# 二进制文件
+/grok_*
+/minirelay*
+/socks5relay*
+/proxytest*
+/turnstile-server*
