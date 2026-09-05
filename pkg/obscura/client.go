@@ -307,11 +307,13 @@ func StartObscuraCmdWithOpts(ctx context.Context, proxy, ua string, port int, us
 		args = append(args, "--no-webgl-rust")
 	}
 
-		// 时区与出口 IP 一致:注册出口多为中国区代理,固定 Asia/Shanghai,
-	// 避免 UA(Windows/Chrome)与 Date/Intl 时区自相矛盾(CF 指纹必查)。
+		// 时区跟随代理出口 IP 的真实地区(Camoufox geoip 流程):通过代理查
+	// ip-api.com 拿 IANA timezone,Date/Intl 与 IP 地理位置一致(CF 必查)。
 	env := os.Environ()
 	if os.Getenv("OBSCURA_TIMEZONE") == "" && os.Getenv("TZ") == "" {
-		env = append(env, "OBSCURA_TIMEZONE=Asia/Shanghai", "TZ=Asia/Shanghai")
+		geo := ResolveProxyGeo(proxy, "Asia/Shanghai")
+		env = append(env, "OBSCURA_TIMEZONE="+geo.Timezone, "TZ="+geo.Timezone,
+			"OBSCURA_LOCALE="+geo.Locale)
 	} else {
 		env = append(env)
 	}
