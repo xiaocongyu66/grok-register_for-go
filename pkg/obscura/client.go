@@ -32,6 +32,10 @@ type Client struct {
 	targetID  string // 当前页面 ID
 	eventCallback EventCallback // CDP 事件回调
 	sessionID string // 当前 session ID(flatten CDP 用)
+	// 人形轨迹光标状态(HumanMoveTo/HumanClick 维护)
+	mouseMu    sync.Mutex
+	mouseX     float64
+	mouseY     float64
 }
 
 // NewClient 连接 obscura 的 CDP 端口(browser-level)
