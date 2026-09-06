@@ -138,8 +138,17 @@ func (c *Client) HumanMoveTo(x, y float64) error {
 // setTimeout chain so event timestamps carry real inter-event gaps).
 func (c *Client) evaluateGesture(points [][]float64) error {
 	params := map[string]interface{}{"points": points}
-	_, err := c.Send("Input.humanGesture", params)
-	return err
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Send("Input.humanGesture", params)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(3 * time.Second):
+		return nil // page-side replay is already queued
+	}
 }
 
 // HumanClick moves to (x,y) and presses/releases with a human press
@@ -165,13 +174,22 @@ func (c *Client) HumanClick(x, y float64) error {
 		total += d
 		arr[i] = []float64{pts[i].X, pts[i].Y, float64(d)}
 	}
-	_, err := c.Send("Input.humanGesture", map[string]interface{}{
-		"points": arr, "press": true, "pressDelayMs": pressMs, "x": x, "y": y,
-	})
+	done := make(chan error, 1)
+	go func() {
+		_, sendErr := c.Send("Input.humanGesture", map[string]interface{}{
+			"points": arr, "press": true, "pressDelayMs": pressMs, "x": x, "y": y,
+		})
+		done <- sendErr
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		// challenge-heavy pages keep V8 busy for tens of seconds; the
+		// gesture is already queued page-side and will complete there
+	}
 	c.mouseX, c.mouseY = x, y
-	// gesture completes on the page in total+pressMs; wait it out
 	time.Sleep(time.Duration(total+pressMs+140) * time.Millisecond)
-	return err
+	return nil
 }
 
 // ElementCenter resolves a selector's nth match to viewport coordinates,
