@@ -223,6 +223,13 @@ func (c *Client) Evaluate(expression string) (string, error) {
 	return "", nil
 }
 
+// GetUserAgent 读取内核指纹 profile 的真实 UA(Servo 内核的 UA 由
+// embedder 内部 profile 决定,启动参数已不再覆盖)。调用方用它对齐
+// curlcffi 的 UA,保证浏览器与 HTTP 客户端同指纹。
+func (c *Client) GetUserAgent() (string, error) {
+	return c.Evaluate("navigator.userAgent")
+}
+
 // WaitForSelector 等待 CSS 选择器出现
 func (c *Client) WaitForSelector(selector string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
@@ -299,27 +306,25 @@ func StartObscura(ctx context.Context, proxy, ua string) (*exec.Cmd, error) {
 // The Rust WebGL backend (real software rendering) is enabled by default.
 // Pass useJsStub=true to use the JS stub instead (faster, no real rendering).
 func StartObscuraCmdWithOpts(ctx context.Context, proxy, ua string, port int, useJsStub bool) (*exec.Cmd, int, error) {
-	args := []string{"serve", "--port", fmt.Sprintf("%d", port), "--allow-private-network"}
+	// Servo-kernel CLI (obscura-merge): `obscura serve --port N [--proxy P]`.
+	// The kernel owns the fingerprint profile (UA + Chrome TLS); --proxy is
+	// injected into http_proxy/https_proxy and honored by Servo's
+	// ProxyConnector. ua/useJsStub are legacy options kept for signature
+	// compatibility — the Servo kernel ignores both.
+	_ = ua
+	_ = useJsStub
+	args := []string{"serve", "--port", fmt.Sprintf("%d", port)}
 	if proxy != "" {
 		args = append(args, "--proxy", proxy)
 	}
-	args = append(args, "--stealth")
-	if ua != "" {
-		args = append(args, "--user-agent", ua)
-	}
-	if useJsStub {
-		args = append(args, "--no-webgl-rust")
-	}
 
-		// 时区跟随代理出口 IP 的真实地区(Camoufox geoip 流程):通过代理查
+		// 时区跟随代理出口 IP 的真实地区(geoip 流程):通过代理查
 	// ip-api.com 拿 IANA timezone,Date/Intl 与 IP 地理位置一致(CF 必查)。
 	env := os.Environ()
 	if os.Getenv("OBSCURA_TIMEZONE") == "" && os.Getenv("TZ") == "" {
 		geo := ResolveProxyGeo(proxy, "Asia/Shanghai")
 		env = append(env, "OBSCURA_TIMEZONE="+geo.Timezone, "TZ="+geo.Timezone,
 			"OBSCURA_LOCALE="+geo.Locale)
-	} else {
-		env = append(env)
 	}
 cmd := exec.CommandContext(ctx, "obscura", args...)
 	cmd.Env = env

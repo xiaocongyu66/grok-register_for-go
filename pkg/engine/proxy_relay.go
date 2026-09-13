@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -38,10 +37,16 @@ var proxyRelay = &proxyRelayManager{
 	startPort: 19200,
 }
 
+// MaybeRelayProxyPublic 是 maybeRelayProxy 的公开版本,供外部包调用。
+func MaybeRelayProxyPublic(proxy string) string {
+	return maybeRelayProxy(proxy)
+}
+
 // maybeRelayProxy 为浏览器准备代理 URL：
 // 1. 清理 fragment (#name) 和 query (?x=y) — Chrome 的 --proxy-server 不支持这些
-// 2. 带认证的 socks5 → 启动本地无认证中继（Chrome 不支持 socks5 认证）
-// 3. 无认证的 socks5/http → 原样返回（清理后）
+// 2. socks5(带认证/无认证) → 启动本地 HTTP 中继(minirelay)
+//    Chrome 对 socks5 支持不好(本地 DNS 解析,解析到被封 IP),用 HTTP 中继更好
+// 3. http/https 代理 → 原样返回(清理后)
 func maybeRelayProxy(proxy string) string {
 	proxy = strings.TrimSpace(proxy)
 	if proxy == "" {
@@ -53,19 +58,13 @@ func maybeRelayProxy(proxy string) string {
 		scheme = strings.ToLower(proxy[:idx])
 	}
 	if !strings.HasPrefix(scheme, "socks") {
-		// http/https 代理：清理 fragment/query，带认证 Chrome 原生支持
-		return cleanProxyURL(proxy)
-	}
-	// socks5：判断是否带认证（user:pass@）
-	atIdx := strings.Index(proxy, "@")
-	schemeEnd := strings.Index(proxy, "://")
-	hasAuth := atIdx > 0 && atIdx > schemeEnd
-	if !hasAuth {
-		// socks5 无认证：清理 fragment/query，Chrome 原生支持
+		// http/https 代理：清理 fragment/query，Chrome 原生支持
 		return cleanProxyURL(proxy)
 	}
 
-	// 带认证的 socks5：启动本地中继
+	// socks5(带认证或无认证):都启动本地中继
+	// Chrome --proxy-server=socks5:// 用本地 DNS,会解析到被封 IP
+	// 用本地 HTTP 中继后,DNS 在中继端(或代理端)解析
 	proxyRelay.mu.Lock()
 	defer proxyRelay.mu.Unlock()
 
@@ -75,7 +74,7 @@ func maybeRelayProxy(proxy string) string {
 
 	result := proxyRelay.startRelay(proxy)
 	if result == nil {
-		// 中继失败，返回清理后的原代理（浏览器会报 ERR_NO_SUPPORTED_PROXIES，但至少不卡死）
+		// 中继失败,返回清理后的原代理(浏览器会报错,但至少不卡死)
 		return cleanProxyURL(proxy)
 	}
 	proxyRelay.relays[proxy] = result.proc
@@ -106,10 +105,12 @@ func (m *proxyRelayManager) startRelay(upstream string) *relayResult {
 
 	port := m.allocatePort()
 	listen := fmt.Sprintf("127.0.0.1:%d", port)
-	localURL := fmt.Sprintf("socks5://%s", listen)
+	// 用 http:// 而不是 socks5://,因为 Chrome 对 socks5 的 DNS 处理有问题(本地 DNS 解析到被封 IP)
+	// socks5relay 的 HTTP CONNECT 模式用远程 DNS
+	localURL := fmt.Sprintf("http://%s", listen)
 
 	cmd := exec.Command(bin, "--listen", listen, "--upstream", upstream)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setSysProcAttr(cmd)
 	logDir := filepath.Join(ProjectRoot(), "logs", "proxy-relay")
 	os.MkdirAll(logDir, 0755)
 	logPath := filepath.Join(logDir, fmt.Sprintf("relay-%d.log", port))
@@ -131,7 +132,7 @@ func (m *proxyRelayManager) startRelay(upstream string) *relayResult {
 		return nil
 	}
 
-	fmt.Printf("[relay] %s → %s (auth stripped)\n", listen, upstream)
+	fmt.Printf("[relay] %s → %s (HTTP, remote DNS)\n", listen, upstream)
 
 	return &relayResult{
 		localURL: localURL,
@@ -176,7 +177,7 @@ func relayAlive(r *relayProc) bool {
 	if r == nil || r.cmd == nil || r.cmd.Process == nil {
 		return false
 	}
-	return r.cmd.Process.Signal(syscall.Signal(0)) == nil
+	return processAlive(r.cmd.Process)
 }
 
 func waitPortReady(host string, port int, timeout time.Duration) bool {
@@ -204,3 +205,6 @@ func StopAllRelays() {
 	}
 	proxyRelay.relays = make(map[string]*relayProc)
 }
+
+// MaybeRelayProxy 导出版：socks5 → 本地 HTTP 中继（remote DNS），http 直通。
+func MaybeRelayProxy(proxy string) string { return maybeRelayProxy(proxy) }
