@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"os"
@@ -85,72 +86,160 @@ func solveTurnstileObscura(siteKey, proxy string, ua UAProfile) (string, error) 
 	// 导航到 accounts.x.ai 注册页:sitekey 绑定该域名,CF 2026-08 起强制
 	// origin 校验——about:blank 上渲染 widget 返回 110200 (Domain not
 	// authorized),永远拿不到 token。必须在真实 origin 上渲染。
-	// 页面自身会加载 challenges.cloudflare.com 的 api.js,注入前先探 ready。
 	signupURL := "https://accounts.x.ai/sign-up?redirect=grok-com"
 	if err := client.Navigate(signupURL); err != nil {
 		return "", fmt.Errorf("obscura navigate %s: %w", signupURL, err)
 	}
-	time.Sleep(2 * time.Second)
-
-	// 导航后 JS 覆盖:navigator.userAgentData / hardwareConcurrency / deviceMemory
-	// (CDP metadata 不改 JS brands,这里补齐 JS 层一致性)
-	client.Evaluate(buildNavOverrideScript(ua))
-
-	// 注入 turnstile widget
-	client.Evaluate(fmt.Sprintf(`(() => {
-		var s = document.createElement('script');
-		s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
-		s.async = true;
-		document.head.appendChild(s);
-	})()`))
-
-	// 等 turnstile API ready
-	ready := false
-	for i := 0; i < 90; i++ {
-		r, _ := client.Evaluate("typeof turnstile !== 'undefined' ? 'yes' : 'no'")
-		if r == "yes" {
-			ready = true
+	// React 水合需要时间;轮询到页面就绪(最多 20s)。x.ai 注册是两步流:
+	// 先点「使用邮箱注册」进入表单,然后才有 email input。
+	emailSel := ""
+	for i := 0; i < 20; i++ {
+		time.Sleep(1 * time.Second)
+		pageState, _ := client.Evaluate(`(function(){
+			var ip = document.querySelector('input[type=email], input[name=email], input[autocomplete=email]');
+			var blocked = /Blocked due to|abusive traffic/i.test(document.body && document.body.innerText || '');
+			return JSON.stringify({email: !!ip, blocked: blocked,
+				text: (document.body && document.body.innerText || '').slice(0, 80)});
+		})()`)
+		if strings.Contains(pageState, `"blocked":true`) {
+			return "", fmt.Errorf("proxy IP blocked by x.ai (abusive traffic patterns) — need a clean IP")
+		}
+		if strings.Contains(pageState, `"email":true`) {
+			emailSel = "input[type=email], input[name=email], input[autocomplete=email]"
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
 	}
-	if !ready {
-		return "", fmt.Errorf("turnstile api.js failed to load after 45s")
+	if emailSel == "" {
+		// 第二步:页面在方式选择页——用真实鼠标点「使用邮箱注册」。
+		pickJS := `(function(){
+			var els = document.querySelectorAll('button, a, [role=button], div');
+			for (var i=0;i<els.length;i++){
+				var t = (els[i].textContent||'').replace(/\s+/g,'');
+				var r = els[i].getBoundingClientRect();
+				if (r.width > 0 && (t === '使用邮箱注册' || t === 'Sign up with email' || /signupwithemail/i.test(els[i].id||'') || /signupwithemail/i.test(els[i].className||''))) {
+					els[i].scrollIntoView({block:'center'});
+					var rc = els[i].getBoundingClientRect();
+					return JSON.stringify({ok:true, x: rc.x + rc.width/2, y: rc.y + rc.height/2});
+				}
+			}
+			return JSON.stringify({ok:false});
+		})()`
+		pick, _ := client.Evaluate(pickJS)
+		if !strings.Contains(pick, `"ok":true`) {
+			txt, _ := client.Evaluate(`(document.body && document.body.innerText || '').slice(0, 150)`)
+			return "", fmt.Errorf("email-signup entry not found, page=%q", txt)
+		}
+		var pv struct {
+			X float64 `json:"x"`
+			Y float64 `json:"y"`
+		}
+		if err := json.Unmarshal([]byte(pick), &pv); err != nil {
+			return "", fmt.Errorf("parse entry rect: %w", err)
+		}
+		fmt.Printf("[ts] obscura human click '使用邮箱注册' (%.0f, %.0f)\n", pv.X, pv.Y)
+		if err := client.HumanClick(pv.X, pv.Y); err != nil {
+			return "", fmt.Errorf("human click email entry: %w", err)
+		}
+		// 诊断:真实点击 3s 无效时,JS click 对照(区分事件合成缺口 vs 选择器错)。
+		time.Sleep(3 * time.Second)
+		chk, _ := client.Evaluate(`!!document.querySelector('input[type=email]')`)
+		if chk != "true" {
+			jsr, _ := client.Evaluate(`(function(){
+				var els = document.querySelectorAll('button, a, [role=button], div');
+				for (var i=0;i<els.length;i++){
+					var t = (els[i].textContent||'').replace(/\s+/g,'');
+					if ((t === '使用邮箱注册' || t === 'Sign up with email') && els[i].getBoundingClientRect().width > 0) {
+						els[i].click();
+						return 'js-clicked';
+					}
+				}
+				return 'not-found';
+			})()`)
+			fmt.Printf("[ts] diag: real click ineffective, fallback %s\n", jsr)
+		}
+		// 等表单出现(最多 15s)。
+		for j := 0; j < 15; j++ {
+			time.Sleep(1 * time.Second)
+			has, _ := client.Evaluate(`!!document.querySelector('input[type=email], input[name=email], input[autocomplete=email]')`)
+			if has == "true" {
+				emailSel = "input[type=email], input[name=email], input[autocomplete=email]"
+				break
+			}
+		}
 	}
-	fmt.Println("[ts] obscura turnstile API ready")
+	if emailSel == "" {
+		txt, _ := client.Evaluate(`(document.body && document.body.innerText || '').slice(0, 150)`)
+		return "", fmt.Errorf("email input still missing after entry click, page=%q", txt)
+	}
 
-	// 渲染 turnstile widget
-	client.Evaluate(fmt.Sprintf(`(() => {
-		turnstile.render(document.body, {
-			sitekey: '%s',
-			callback: function(token) { window.__ts_token = token; }
-		});
-	})()`, siteKey))
+	// 导航后 JS 覆盖:navigator.userAgentData / hardwareConcurrency / deviceMemory
+	client.Evaluate(buildNavOverrideScript(ua))
 
-	// 轮询 token;managed 模式自动跑,交互模式需要点击。先纯等 5s,然后
-	// 用真实鼠标(人形贝塞尔轨迹 → compositor 命中测试,非 JS 合成事件)点
-	// widget host 中心——事件穿过 closed shadow 命中 challenge iframe。
-	// 最多点 3 次,每次间隔 5s,总窗口 50s。
-	clicked := 0
+	// ── 真实用户流:填邮箱(人形键盘) → 点提交(人形鼠标) ──
+	// x.ai 的 turnstile 是 execution:'execute' 模式:表单提交触发 widget
+	// execute → challenge 跑完 → token 写进页面自己的 input[name=cf-turnstile-response]。
+	// 页面自己的 widget 已由 React render(我们再 render 会报参数变更错),不碰它。
+	randLocal := fmt.Sprintf("reg%d%d", time.Now().Unix()%100000, secureRandInt(900)+100)
+	email := randLocal + "@moemail.app"
+	fmt.Printf("[ts] obscura typing email %s (human keyboard)\n", email)
+	if err := client.HumanTypeInto(email, emailSel); err != nil {
+		return "", fmt.Errorf("human type email: %w", err)
+	}
+	time.Sleep(800 * time.Millisecond)
+
+	// 提交按钮:文本匹配 Continue/Sign up 的可见按钮,从上往下第一个。
+	btnSel := `button[type=submit], form button`
+	clickedJS := `(function(){
+		var btns = document.querySelectorAll('` + btnSel + `');
+		for (var i=0;i<btns.length;i++){
+			var t = (btns[i].textContent||'').toLowerCase();
+			var r = btns[i].getBoundingClientRect();
+			if (r.width > 0 && (t.includes('continue') || t.includes('sign up') || t.includes('next'))) {
+				btns[i].scrollIntoView({block:'center'});
+				var rc = btns[i].getBoundingClientRect();
+				return JSON.stringify({ok:true, x: rc.x + rc.width/2, y: rc.y + rc.height/2, text: (btns[i].textContent||'').trim().slice(0,20)});
+			}
+		}
+		return JSON.stringify({ok:false});
+	})()`
+	clickTarget, _ := client.Evaluate(clickedJS)
+	if !strings.Contains(clickTarget, `"ok":true`) {
+		return "", fmt.Errorf("submit button not found on sign-up page")
+	}
+	var ct struct {
+		X    float64 `json:"x"`
+		Y    float64 `json:"y"`
+		Text string  `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(clickTarget), &ct); err != nil {
+		return "", fmt.Errorf("parse button rect: %w", err)
+	}
+	fmt.Printf("[ts] obscura human click submit '%s' (%.0f, %.0f)\n", ct.Text, ct.X, ct.Y)
+	if err := client.HumanClick(ct.X, ct.Y); err != nil {
+		return "", fmt.Errorf("human click submit: %w", err)
+	}
+
+	// 轮询页面自己的 response input(真实流产物),总窗口 50s。
 	for i := 0; i < 100; i++ {
-		r, _ := client.Evaluate("window.__ts_token || ''")
+		r, _ := client.Evaluate(`(function(){
+			var el = document.querySelector('input[name=cf-turnstile-response]');
+			return (el && el.value) || '';
+		})()`)
 		if len(r) > 20 {
 			fmt.Printf("[ts] obscura token: %s...\n", r[:20])
 			return r, nil
 		}
-		if i >= 10 && clicked < 3 && (i-10)%10 == 0 {
-			if x, y, err := client.ElementCenter(`[class*=cf-turnstile], [id^=cf-chl-widget]`, 0); err == nil {
-				fmt.Printf("[ts] obscura human click (%.0f, %.0f) #%d\n", x, y, clicked+1)
-				if clickErr := client.HumanClick(x, y); clickErr != nil {
-					fmt.Printf("[ts] obscura human click error: %v\n", clickErr)
-				}
+		// execute 后 widget 可能弹可见挑战(managed 模式):点 widget 中心辅助。
+		if i == 30 || i == 60 {
+			if x, y, err := client.ElementCenter(`[id^=cf-chl-widget]`, 0); err == nil && x > 1 {
+				fmt.Printf("[ts] obscura human click widget (%.0f, %.0f)\n", x, y)
+				_ = client.HumanClick(x, y)
 			}
-			clicked++
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	return "", fmt.Errorf("turnstile: timeout after 50s (obscura)")
+	return "", fmt.Errorf("turnstile: timeout after 50s (obscura real-flow)")
 }
 
 // secureRandInt 返回 [0, max) 的加密安全随机整数(max > 0)。
