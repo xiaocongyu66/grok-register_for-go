@@ -26,6 +26,14 @@ func main() {
 	timeout := flag.Int("timeout", 150, "overall timeout seconds")
 	flag.Parse()
 
+	// 测试工具:真实建箱(与生产同路径),保证浏览器填的地址可收验证码。
+	handle, mhErr := engine.CreateMailbox()
+	if mhErr != nil {
+		fmt.Printf("[xai] FAIL create mailbox: %v\n", mhErr)
+		os.Exit(1)
+	}
+	fmt.Printf("[xai] mailbox: %s\n", handle.Email)
+
 	ua := engine.RandomUAProfile()
 	fmt.Printf("[xai] UA profile: %s\n", ua.UserAgent)
 	if *proxy != "" {
@@ -35,7 +43,7 @@ func main() {
 	done := make(chan error, 1)
 	var token string
 	go func() {
-		tok, err := engine.SolveTurnstileWithUA("0x4AAAAAAAhr9JGVDZbrZOo0", *proxy, ua)
+		tok, err := engine.SolveTurnstileWithUA("0x4AAAAAAAhr9JGVDZbrZOo0", *proxy, handle.Email, ua)
 		token = tok
 		done <- err
 	}()

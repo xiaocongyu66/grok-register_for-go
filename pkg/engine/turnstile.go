@@ -14,8 +14,8 @@ import (
 )
 
 // SolveTurnstile 用随机 UA 求解 turnstile(会话级 UA 一致性)。
-func SolveTurnstile(siteKey, proxy string) (string, error) {
-	return SolveTurnstileWithUA(siteKey, proxy, RandomUAProfile())
+func SolveTurnstile(siteKey, proxy, email string) (string, error) {
+	return SolveTurnstileWithUA(siteKey, proxy, email, RandomUAProfile())
 }
 
 // SolveTurnstileWithUA 用指定的 UA profile 求解 turnstile(会话级 UA 一致性)。
@@ -26,9 +26,9 @@ func SolveTurnstile(siteKey, proxy string) (string, error) {
 // chaser-oxide(CGO)、playwright/CloakBrowser 与 camoufox 回退均已移除:
 // chaser 的 Rust FFI 会 SIGSEGV;Servo 内核已完整走通 Turnstile(CF demo
 // 拿到 token),作为唯一浏览器求解路径。
-func SolveTurnstileWithUA(siteKey, proxy string, ua UAProfile) (string, error) {
+func SolveTurnstileWithUA(siteKey, proxy, email string, ua UAProfile) (string, error) {
 	// 1. obscura(Servo 内核,唯一浏览器求解路径)
-	tok, err := solveTurnstileObscura(siteKey, proxy, ua)
+	tok, err := solveTurnstileObscura(siteKey, proxy, email, ua)
 	if err == nil {
 		return tok, nil
 	}
@@ -49,7 +49,7 @@ func SolveTurnstileWithUA(siteKey, proxy string, ua UAProfile) (string, error) {
 // solveTurnstileObscura 用 obscura(Rust headless 浏览器)求解 turnstile。
 // obscura 通过 CDP 端口连接,内置 stealth,协议级代理(不用 --proxy-server)。
 // 在 about:blank 页面注入 turnstile widget,不需要导航 xAI。
-func solveTurnstileObscura(siteKey, proxy string, ua UAProfile) (string, error) {
+func solveTurnstileObscura(siteKey, proxy, email string, ua UAProfile) (string, error) {
 	// 准备代理(obscura 支持 http:// 和 socks5://)
 	browserProxy := maybeRelayProxy(proxy)
 
@@ -179,8 +179,11 @@ func solveTurnstileObscura(siteKey, proxy string, ua UAProfile) (string, error) 
 	// x.ai 的 turnstile 是 execution:'execute' 模式:表单提交触发 widget
 	// execute → challenge 跑完 → token 写进页面自己的 input[name=cf-turnstile-response]。
 	// 页面自己的 widget 已由 React render(我们再 render 会报参数变更错),不碰它。
-	randLocal := fmt.Sprintf("reg%d%d", time.Now().Unix()%100000, secureRandInt(900)+100)
-	email := randLocal + "@moemail.app"
+	// 邮箱必须与注册 POST 的地址严格一致(enroller 的 handle.Email),
+	// 浏览器里填的和 curlcffi 发码的若不同,x.ai 必然识破。
+	if strings.TrimSpace(email) == "" {
+		return "", fmt.Errorf("real-flow solve requires the enrolled email address")
+	}
 	fmt.Printf("[ts] obscura typing email %s (human keyboard)\n", email)
 	if err := client.HumanTypeInto(email, emailSel); err != nil {
 		return "", fmt.Errorf("human type email: %w", err)

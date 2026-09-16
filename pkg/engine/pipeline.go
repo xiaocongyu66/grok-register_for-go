@@ -115,14 +115,19 @@ func (p *Pipeline) worker(id int, cfg *SignupConfig, wg *sync.WaitGroup) {
 }
 
 func (p *Pipeline) registerOnce(wid int, cfg *SignupConfig) error {
+	// 0. 选会话级 UA profile(整个注册流程共用)
+	// curlcffi 和 chaser 浏览器用同一个 UA,保证 UA/sec-ch-ua/TLS 三者配套
+	uaProfile := RandomUAProfile()
+	fmt.Printf("[W%d] session UA: %s\n", wid, uaProfile.String())
+
 	// 1. Create mailbox
 	handle, err := CreateMailbox()
 	if err != nil {
 		return fmt.Errorf("mailbox: %w", err)
 	}
 
-	// 2. Create xAI client + warm
-	client, err := NewXaiClient(p.Proxy, 30*time.Second)
+	// 2. Create xAI client with session UA
+	client, err := NewXaiClientWithUA(p.Proxy, 30*time.Second, uaProfile)
 	if err != nil {
 		return fmt.Errorf("client: %w", err)
 	}
@@ -143,9 +148,10 @@ func (p *Pipeline) registerOnce(wid int, cfg *SignupConfig) error {
 	}()
 
 	// 3b. Solve turnstile（与 send code 并行，不互相依赖）
+	// 用同一个 UA profile,保证浏览器 UA 和 curlcffi 一致
 	go func() {
 		defer w.Done()
-		token, tokenErr = SolveTurnstile(cfg.SiteKey, p.Proxy)
+		token, tokenErr = SolveTurnstileWithUA(cfg.SiteKey, p.Proxy, handle.Email, uaProfile)
 	}()
 
 	// 3c. Poll email code（send code 发出后开始轮询）
