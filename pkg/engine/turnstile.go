@@ -187,14 +187,17 @@ func solveTurnstileObscura(siteKey, proxy string, ua UAProfile) (string, error) 
 	}
 	time.Sleep(800 * time.Millisecond)
 
-	// 提交按钮:文本匹配 Continue/Sign up 的可见按钮,从上往下第一个。
-	btnSel := `button[type=submit], form button`
+	// 提交按钮:文本匹配(多语言,随出口 locale 变化)的可见可点元素,
+	// 从上往下第一个;选择器含 role=button(x.ai 用过非 button 标签)。
 	clickedJS := `(function(){
-		var btns = document.querySelectorAll('` + btnSel + `');
+		var btns = document.querySelectorAll('button[type=submit], form button, button, [role=button]');
 		for (var i=0;i<btns.length;i++){
-			var t = (btns[i].textContent||'').toLowerCase();
+			var t = (btns[i].textContent||'').toLowerCase().replace(/\s+/g,'');
 			var r = btns[i].getBoundingClientRect();
-			if (r.width > 0 && (t.includes('continue') || t.includes('sign up') || t.includes('next'))) {
+			if (r.width > 0 && (
+				t.includes('continue') || t.includes('继续') ||
+				t.includes('signup') || t.includes('注册') ||
+				t.includes('next') || t.includes('下一步'))) {
 				btns[i].scrollIntoView({block:'center'});
 				var rc = btns[i].getBoundingClientRect();
 				return JSON.stringify({ok:true, x: rc.x + rc.width/2, y: rc.y + rc.height/2, text: (btns[i].textContent||'').trim().slice(0,20)});
@@ -204,7 +207,11 @@ func solveTurnstileObscura(siteKey, proxy string, ua UAProfile) (string, error) 
 	})()`
 	clickTarget, _ := client.Evaluate(clickedJS)
 	if !strings.Contains(clickTarget, `"ok":true`) {
-		return "", fmt.Errorf("submit button not found on sign-up page")
+		// dump 一下当前可点元素,便于下次匹配迭代。
+		dump, _ := client.Evaluate(`(function(){
+			var out=[];document.querySelectorAll('button,[role=button]').forEach(function(b){var r=b.getBoundingClientRect();if(r.width>0)out.push((b.textContent||'').trim().slice(0,16));});return JSON.stringify(out.slice(0,8));
+		})()`)
+		return "", fmt.Errorf("submit button not found (clickables=%s)", dump)
 	}
 	var ct struct {
 		X    float64 `json:"x"`
