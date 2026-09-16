@@ -54,10 +54,12 @@ func SolveTurnstileWithUA(siteKey, proxy, email string, ua UAProfile) (string, e
 func solveTurnstileObscura(siteKey, proxy, email string, ua UAProfile) (string, error) {
 	// 准备代理(obscura 支持 http:// 和 socks5://)
 	browserProxy := maybeRelayProxy(proxy)
-	// 预热:relay 背后的 hy2 隧道冷启动要 2-5s(mport 优选),内核 ProxyConnector
-	// 的 15s 拨号超时会被撞上(间歇性 "failed to create underlying connection")。
-	// 先用 curlcffi 同款 transport 把隧道打热,内核 CONNECT 时秒级建联。
-	warmRelayTunnel(browserProxy)
+	// hy2 上游会话是活动驱动的("no recent network activity" 即断),存活窗口
+	// 只有几秒——单次预热打活了上游,内核 boot 的 10-30s 里又死掉。改为
+	// solve 全程后台保活:每 3s 打一次 x.ai,持续激活上游会话,直到 solve 返回。
+	stopWarm := make(chan struct{})
+	go keepRelayAlive(browserProxy, stopWarm)
+	defer close(stopWarm)
 
 	// 启动 obscura serve(带 stealth + proxy + UA)
 	// Rust WebGL 后端默认启用。OBSCURA_NO_WEBGL_RUST=1 用 JS stub。
@@ -304,9 +306,9 @@ func buildNavOverrideScript(ua UAProfile) string {
 // BuildNavOverrideScript 导出版：导航后 JS 覆盖 userAgentData/hardwareConcurrency。
 func BuildNavOverrideScript(ua UAProfile) string { return buildNavOverrideScript(ua) }
 
-// warmRelayTunnel 在内核启动前把代理隧道的上游会话打热:3 次经代理的 HEAD,
-// 失败不重试也不报错——预热是尽力而为,真正的连通性由求解流程自己负责。
-func warmRelayTunnel(proxy string) {
+// keepRelayAlive 在 solve 期间持续经代理打 x.ai,把 hy2 上游会话钉在活跃态。
+// 每次往返失败直接跳过(上游可能瞬断),循环本身不受影响;stop 关闭即退出。
+func keepRelayAlive(proxy string, stop <-chan struct{}) {
 	if strings.TrimSpace(proxy) == "" {
 		return
 	}
@@ -314,19 +316,36 @@ func warmRelayTunnel(proxy string) {
 	if err != nil {
 		return
 	}
-	client := &http.Client{
-		Timeout: 20 * time.Second,
-		Transport: &http.Transport{Proxy: http.ProxyURL(pu)},
-	}
-	for i := 0; i < 3; i++ {
-		req, _ := http.NewRequest(http.MethodHead, "https://accounts.x.ai/sign-up", nil)
-		resp, err := client.Do(req)
-		if err == nil {
-			resp.Body.Close()
-			fmt.Printf("[ts] relay warm-up #%d ok (%s)\n", i+1, resp.Status)
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	okCount, failCount := 0, 0
+	for {
+		select {
+		case <-stop:
+			fmt.Printf("[ts] relay keepalive done (ok=%d fail=%d)\n", okCount, failCount)
 			return
+		case <-ticker.C:
+			// 禁用连接复用:每个 tick 新建 transport 并带 Connection: close,
+			// 强制走真实的 CONNECT+新拨号路径——与内核的连接方式同构。
+			// 复用连接会让 keepalive 变成假活(11/11 ok 而内核全死的实证)。
+			fresh := &http.Client{
+				Timeout: 8 * time.Second,
+				Transport: &http.Transport{
+					Proxy:               http.ProxyURL(pu),
+					DisableKeepAlives:   true,
+					MaxIdleConns:        0,
+					IdleConnTimeout:     time.Millisecond,
+				},
+			}
+			req, _ := http.NewRequest(http.MethodHead, "https://accounts.x.ai/sign-up", nil)
+			req.Close = true
+			resp, err := fresh.Do(req)
+			if err == nil {
+				resp.Body.Close()
+				okCount++
+			} else {
+				failCount++
+			}
 		}
-		fmt.Printf("[ts] relay warm-up #%d: %v\n", i+1, err)
-		time.Sleep(800 * time.Millisecond)
 	}
 }
