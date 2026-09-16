@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -52,6 +54,10 @@ func SolveTurnstileWithUA(siteKey, proxy, email string, ua UAProfile) (string, e
 func solveTurnstileObscura(siteKey, proxy, email string, ua UAProfile) (string, error) {
 	// 准备代理(obscura 支持 http:// 和 socks5://)
 	browserProxy := maybeRelayProxy(proxy)
+	// 预热:relay 背后的 hy2 隧道冷启动要 2-5s(mport 优选),内核 ProxyConnector
+	// 的 15s 拨号超时会被撞上(间歇性 "failed to create underlying connection")。
+	// 先用 curlcffi 同款 transport 把隧道打热,内核 CONNECT 时秒级建联。
+	warmRelayTunnel(browserProxy)
 
 	// 启动 obscura serve(带 stealth + proxy + UA)
 	// Rust WebGL 后端默认启用。OBSCURA_NO_WEBGL_RUST=1 用 JS stub。
@@ -297,3 +303,30 @@ func buildNavOverrideScript(ua UAProfile) string {
 
 // BuildNavOverrideScript 导出版：导航后 JS 覆盖 userAgentData/hardwareConcurrency。
 func BuildNavOverrideScript(ua UAProfile) string { return buildNavOverrideScript(ua) }
+
+// warmRelayTunnel 在内核启动前把代理隧道的上游会话打热:3 次经代理的 HEAD,
+// 失败不重试也不报错——预热是尽力而为,真正的连通性由求解流程自己负责。
+func warmRelayTunnel(proxy string) {
+	if strings.TrimSpace(proxy) == "" {
+		return
+	}
+	pu, err := url.Parse(proxy)
+	if err != nil {
+		return
+	}
+	client := &http.Client{
+		Timeout: 20 * time.Second,
+		Transport: &http.Transport{Proxy: http.ProxyURL(pu)},
+	}
+	for i := 0; i < 3; i++ {
+		req, _ := http.NewRequest(http.MethodHead, "https://accounts.x.ai/sign-up", nil)
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			fmt.Printf("[ts] relay warm-up #%d ok (%s)\n", i+1, resp.Status)
+			return
+		}
+		fmt.Printf("[ts] relay warm-up #%d: %v\n", i+1, err)
+		time.Sleep(800 * time.Millisecond)
+	}
+}

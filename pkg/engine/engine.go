@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -68,6 +69,11 @@ type RegisterEngine struct {
 	workers int
 	stats   *Stats
 	stop    chan struct{}
+
+	// WARP 代理模式
+	warpFallback bool // 普通代理失败时自动切换到 WARP
+	warpOnly     bool // 只用 WARP 代理(不用普通代理池)
+	warpStarted  bool // WARP 隧道是否已启动(避免重复启动)
 }
 
 func NewRegisterEngine(target, workers int) *RegisterEngine {
@@ -75,12 +81,49 @@ func NewRegisterEngine(target, workers int) *RegisterEngine {
 		workers = 1
 	}
 	return &RegisterEngine{
-		pool:    &ProxyPool{},
-		target:  target,
-		workers: workers,
-		stats:   &Stats{},
-		stop:    make(chan struct{}),
+		pool:         &ProxyPool{},
+		target:       target,
+		workers:      workers,
+		stats:        &Stats{},
+		stop:         make(chan struct{}),
+		warpFallback: true, // 默认启用 WARP fallback
 	}
+}
+
+// SetWarpFallback 设置是否启用 WARP fallback(普通代理失败时自动切换)
+func (e *RegisterEngine) SetWarpFallback(enable bool) {
+	e.warpFallback = enable
+	if !enable {
+		e.warpOnly = false
+	}
+}
+
+// SetWarpOnly 设置只用 WARP 代理(不用普通代理池)
+func (e *RegisterEngine) SetWarpOnly(only bool) {
+	e.warpOnly = only
+	if only {
+		e.warpFallback = false
+	}
+}
+
+// startWarpFallback 启动 WARP 隧道并加入代理池(fallback 模式)。
+// 在普通代理连续失败时调用,启动 WARP 作为备用代理。
+// 只启动一次(用 warpStarted 标志防止重复)。
+func (e *RegisterEngine) startWarpFallback() {
+	if e.warpStarted {
+		return
+	}
+	e.warpStarted = true
+
+	hy2Nodes := GetWarpHy2Nodes()
+	urls := StartWARPTunnels(hy2Nodes)
+	if len(urls) == 0 {
+		fmt.Println("[warp] fallback 隧道启动失败")
+		return
+	}
+	// 把 WARP socks5 加入代理池
+	e.pool.addRunningWARPTunnels()
+	fmt.Printf("[warp] ✅ WARP fallback 已加入代理池(共 %d 条隧道)\n", len(urls))
 }
 
 func (e *RegisterEngine) Run() int {
@@ -92,9 +135,26 @@ func (e *RegisterEngine) Run() int {
 	batchStartTime = time.Now()
 	fmt.Printf("[batch] 本批时间戳: %s\n", batchStartTime.Format("200601021504"))
 
-	e.pool.loadFromFile()
-	e.pool.canRegister = len(e.pool.nodes) > 0
-	fmt.Printf("[pool] 代理: %d\n", len(e.pool.nodes))
+	// warp-only 模式:直接启动 WARP 隧道,不加载普通代理池
+	if e.warpOnly {
+		fmt.Println("[warp] 只用 WARP 代理模式,启动 WARP 双隧道...")
+		// 先加载 warp代理.txt 缓存 hy2 节点(用于 hy2 隧道上游)
+		e.pool.loadWarpProxyFile(nil)
+		hy2Nodes := GetWarpHy2Nodes()
+		urls := StartWARPTunnels(hy2Nodes)
+		if len(urls) == 0 {
+			fmt.Println("[warp] ❌ WARP 隧道启动失败,无法注册")
+			return 0
+		}
+		// 把 WARP socks5 加入代理池
+		e.pool.addRunningWARPTunnels()
+		e.pool.canRegister = len(e.pool.nodes) > 0
+		fmt.Printf("[pool] WARP 代理: %d\n", len(e.pool.nodes))
+	} else {
+		e.pool.loadFromFile()
+		e.pool.canRegister = len(e.pool.nodes) > 0
+		fmt.Printf("[pool] 代理: %d\n", len(e.pool.nodes))
+	}
 
 	// 启动健康检查后台 goroutine:定期重测不健康节点(阶段性死的可能恢复)
 	go e.pool.healthCheckLoop()
@@ -116,7 +176,29 @@ func (e *RegisterEngine) Run() int {
 	}
 	if cfg == nil {
 		fmt.Println("[config] all proxies failed for config fetch")
-		return 0
+		// fallback 模式:启动 WARP 隧道,用 WARP socks5 重新 fetch config
+		if e.warpFallback && !e.warpStarted {
+			fmt.Println("[warp] config fetch 失败,启动 WARP fallback 隧道...")
+			e.startWarpFallback()
+			// 用 WARP socks5 重新 fetch
+			for _, node := range e.pool.nodes {
+				cfgClient, err := NewXaiClient(node.URL, 60*time.Second)
+				if err != nil {
+					continue
+				}
+				cfg, err = cfgClient.FetchConfig()
+				cfgClient.Close()
+				if err == nil && cfg != nil {
+					fmt.Printf("[config] site_key=%s action=%s... source=%s (via %s)\n", cfg.SiteKey, truncate(cfg.ActionID, 12), cfg.Source, node.URL)
+					break
+				}
+				fmt.Printf("[config] try %s: %v\n", node.URL, err)
+			}
+		}
+		if cfg == nil {
+			fmt.Println("[config] ❌ WARP fallback 也无法 fetch config,退出")
+			return 0
+		}
 	}
 
 	// Shared config with auto-refresh on stale action
@@ -193,6 +275,14 @@ func (e *RegisterEngine) worker(id int, scfg *SharedConfig, wg *sync.WaitGroup) 
 			// Auto-refresh config on stale action
 			if strings.Contains(errMsg, "Server action not found") {
 				scfg.Refresh(e.pool.getBest())
+			}
+			// WARP fallback: 连续失败太多时启动 WARP 隧道
+			if e.warpFallback && !e.warpStarted {
+				failCount := atomic.LoadInt64(&e.stats.Failed)
+				if failCount >= 3 && failCount%3 == 0 {
+					fmt.Printf("[warp] 连续失败 %d 次,启动 WARP fallback 隧道...\n", failCount)
+					e.startWarpFallback()
+				}
 			}
 		} else {
 			n := e.stats.BumpOK()
@@ -286,7 +376,15 @@ func (p *ProxyPool) loadFromFile() {
 		fmt.Printf("[pool] %d relay proxies added to pool (score=80, prioritized)\n", len(localProxies))
 	}
 
-	// 3. 启动时验证代理池连通性,去掉不通的节点
+	// 3. 加载 warp代理.txt(hy2 节点记录下来,TCP 协议通过 minirelay 加入代理池)。
+	// WARP 隧道不再自动启动,需要用 'grok warp' 命令单独启动。
+	// 如果 WARP 已经在运行(grok warp 启动过),注册时会自动把 WARP socks5 加入代理池。
+	p.loadWarpProxyFile(hy2)
+
+	// 3.5 如果 WARP 管理器已在运行(grok warp 命令启动过),把 WARP socks5 加入代理池
+	p.addRunningWARPTunnels()
+
+	// 4. 启动时验证代理池连通性,去掉不通的节点
 	p.verifyAll()
 }
 
@@ -368,6 +466,38 @@ func verifyNode(proxyURL string) (bool, string) {
 		return false, "tcp dial: " + err.Error()
 	}
 	conn.Close()
+
+	// TCP 通 ≠ 上游到 x.ai 通:本地 relay 端口永远在线,但 hy2 上游可能
+	// 掉线/被墙(gstatic 204 而 x.ai Bad Gateway 实证过)。对 http/socks5
+	// 做一次真实 HTTPS 探测——拿到任何 HTTP 响应(含 CF 403/挑战页)都算
+	// 链路通,只有 5xx 网关错/超时才算死。
+	if u.Scheme == "http" || u.Scheme == "socks5" {
+		return probeProxyToXai(proxyURL)
+	}
+	return true, ""
+}
+
+// probeProxyToXai 经代理对 accounts.x.ai 发一次 GET,验证上游链路真实可达。
+func probeProxyToXai(proxyURL string) (bool, string) {
+	pu, err := url.Parse(proxyURL)
+	if err != nil {
+		return false, "parse error: " + err.Error()
+	}
+	client := &http.Client{
+		Timeout:   12 * time.Second,
+		Transport: &http.Transport{Proxy: http.ProxyURL(pu)},
+	}
+	req, _ := http.NewRequest(http.MethodGet, "https://accounts.x.ai/sign-up", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, "x.ai probe: " + err.Error()
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 502 {
+		return false, fmt.Sprintf("x.ai probe: HTTP %d", resp.StatusCode)
+	}
+	// 任何非 5xx 状态都证明代理→x.ai 链路活着(403/挑战页也是"通")。
 	return true, ""
 }
 
