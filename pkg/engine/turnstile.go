@@ -98,6 +98,37 @@ func solveTurnstileObscura(siteKey, proxy, email string, ua UAProfile) (string, 
 	if err := client.Navigate(signupURL); err != nil {
 		return "", fmt.Errorf("obscura navigate %s: %w", signupURL, err)
 	}
+	// fetch 探针:页面侧记录所有 fetch 调用(URL/方法/状态/响应开头)。提交
+	// 被 CF 接管成挑战页时,这里能直接看到状态码与 HTML 开头——内核 CDP
+	// Network 域是 stub,页面包装器是唯一观测点。挂在导航后、水合完成前。
+	client.Evaluate(`(function(){
+		try {
+			if (window.__reqlog) return 'already';
+			window.__reqlog = [];
+			var of = window.fetch;
+			window.fetch = function(){
+				var args = arguments;
+				var url = (typeof args[0]==='string') ? args[0] : (args[0] && args[0].url) || '';
+				var method = 'GET';
+				if (args[1] && args[1].method) method = args[1].method;
+				else if (args[0] && args[0].method) method = args[0].method;
+				return of.apply(this, arguments).then(function(resp){
+					var entry = {u:String(url).slice(0,120), m:method, s:resp.status, ct:resp.headers.get('content-type')||''};
+					try {
+						return resp.clone().text().then(function(t){
+							entry.b = t.slice(0, 160);
+							window.__reqlog.push(entry);
+							return resp;
+						});
+					} catch(e) {
+						window.__reqlog.push(entry);
+						return resp;
+					}
+				});
+			};
+			return 'ok';
+		} catch(e) { return 'err:' + e.message; }
+	})()`)
 	// React 水合需要时间;轮询到页面就绪(最多 20s)。x.ai 注册是两步流:
 	// 先点「使用邮箱注册」进入表单,然后才有 email input。
 	emailSel := ""
@@ -263,6 +294,8 @@ func solveTurnstileObscura(siteKey, proxy, email string, ua UAProfile) (string, 
 					text: (document.body.innerText||'').replace(/\s+/g,' ').slice(0, 120)});
 			})()`)
 			fmt.Printf("[ts] wait i=%d: %s\n", i, st)
+			fl, _ := client.Evaluate(`JSON.stringify((window.__reqlog||[]).slice(-5))`)
+			fmt.Printf("[ts] fetchlog: %s\n", fl)
 		}
 		// 确认框里的「注册」:第一次提交后由 React 异步渲染,2s/6s/14s 各找一次。
 		// 只有当位置与表单提交按钮不同(说明确实是新弹的框)才点,且只点一次。
@@ -304,6 +337,9 @@ func solveTurnstileObscura(siteKey, proxy, email string, ua UAProfile) (string, 
 		time.Sleep(500 * time.Millisecond)
 	}
 
+	// 最终诊断:把页面侧 fetch 记录全部打出来,提交类请求的响应真身就在这里。
+	fl, _ := client.Evaluate(`JSON.stringify(window.__reqlog||[])`)
+	fmt.Printf("[ts] fetchlog-final: %s\n", fl)
 	return "", fmt.Errorf("turnstile: timeout after 50s (obscura real-flow)")
 }
 
