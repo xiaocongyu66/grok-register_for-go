@@ -2,7 +2,6 @@ package obscura
 
 import (
 	"fmt"
-	"strings"
 )
 
 // Direct (non-humanized) keyboard input. Complements the HumanType* family:
@@ -17,9 +16,6 @@ import (
 // TypeFull sets the whole value at once and fires the full trusted event
 // chain (focus → input → change) exactly like a paste or autofill fill.
 func (c *Client) TypeFull(selector, text string) error {
-	escaped := strings.ReplaceAll(text, "\\", "\\\\")
-	escaped = strings.ReplaceAll(escaped, "'", "\\'")
-	escaped = strings.ReplaceAll(escaped, "\n", "\\n")
 	js := fmt.Sprintf(`(function(){
   var el = document.querySelector('%s');
   if (!el) return 'no-element';
@@ -28,7 +24,7 @@ func (c *Client) TypeFull(selector, text string) error {
   el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));
   el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {bubbles:true})));
   return 'ok';
-})()`, selector, escaped)
+})()`, jsQuote(selector), jsQuote(text))
 	res, err := c.Evaluate(js)
 	if err != nil {
 		return err
@@ -42,9 +38,6 @@ func (c *Client) TypeFull(selector, text string) error {
 // TypeFullExpr is TypeFull for an arbitrary element-returning expression
 // (frames, shadow hosts, non-selector lookups).
 func (c *Client) TypeFullExpr(focusExpr, text string) error {
-	escaped := strings.ReplaceAll(text, "\\", "\\\\")
-	escaped = strings.ReplaceAll(escaped, "'", "\\'")
-	escaped = strings.ReplaceAll(escaped, "\n", "\\n")
 	js := fmt.Sprintf(`(function(){
   var el = (%s);
   if (!el) return 'no-element';
@@ -53,7 +46,7 @@ func (c *Client) TypeFullExpr(focusExpr, text string) error {
   el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));
   el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {bubbles:true})));
   return 'ok';
-})()`, focusExpr, escaped)
+})()`, focusExpr, jsQuote(text))
 	res, err := c.Evaluate(js)
 	if err != nil {
 		return err

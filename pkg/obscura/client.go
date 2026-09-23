@@ -234,7 +234,7 @@ func (c *Client) GetUserAgent() (string, error) {
 func (c *Client) WaitForSelector(selector string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		result, err := c.Evaluate(fmt.Sprintf(`document.querySelector('%s') ? 'found' : 'not found'`, selector))
+		result, err := c.Evaluate(fmt.Sprintf(`document.querySelector('%s') ? 'found' : 'not found'`, jsQuote(selector)))
 		if err == nil && result == "found" {
 			return nil
 		}
@@ -339,6 +339,14 @@ cmd := exec.CommandContext(ctx, "obscura", args...)
 	if err := cmd.Start(); err != nil {
 		return nil, 0, fmt.Errorf("start obscura: %w", err)
 	}
+	// 进程组收割:调用方 Process.Kill 只杀 serve 本体,servo-kernel 线程
+	// 可能拖住进程不退(残留实例占 61% CPU 的实证)。整组 SIGKILL 兜底。
+	go func() {
+		<-ctx.Done()
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}()
 
 	// 等待 CDP 端口就绪
 	for i := 0; i < 30; i++ {
@@ -600,6 +608,17 @@ func quoteJS(s string) string {
 	return `"` + r + `"`
 }
 
+// jsQuote makes a string safe inside a single-quoted JS string literal —
+// selectors and values interpolated into querySelector('%s') / '%s' go
+// through this, or a quote in the input breaks the expression (or worse).
+func jsQuote(s string) string {
+	r := strings.ReplaceAll(s, `\`, `\\`)
+	r = strings.ReplaceAll(r, `'`, `\'`)
+	r = strings.ReplaceAll(r, "\n", `\n`)
+	r = strings.ReplaceAll(r, "\r", `\r`)
+	return r
+}
+
 // InjectCDPHardening injects CDP leak protection script
 func (c *Client) InjectCDPHardening() error {
 	hardeningScript := `(function(){
@@ -791,14 +810,13 @@ func (c *Client) GetText() (string, error) {
 
 // Click clicks an element by CSS selector
 func (c *Client) Click(selector string) error {
-	_, err := c.Evaluate(fmt.Sprintf(`document.querySelector('%s').click()`, selector))
+	_, err := c.Evaluate(fmt.Sprintf(`document.querySelector('%s').click()`, jsQuote(selector)))
 	return err
 }
 
 // Type types text into an element
 func (c *Client) Type(selector, text string) error {
-	escaped := strings.ReplaceAll(text, "'", "\\'")
-	_, err := c.Evaluate(fmt.Sprintf(`document.querySelector('%s').value = '%s'`, selector, escaped))
+	_, err := c.Evaluate(fmt.Sprintf(`document.querySelector('%s').value = '%s'`, jsQuote(selector), jsQuote(text)))
 	return err
 }
 

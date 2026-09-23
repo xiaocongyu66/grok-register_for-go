@@ -213,7 +213,7 @@ func (c *Client) ElementCenter(selector string, nth int) (float64, float64, erro
     rr = [el.offsetLeft || 0, el.offsetTop || 0, el.offsetWidth || 1, el.offsetHeight || 1];
   }
   return JSON.stringify({ok:true, x:rr[0], y:rr[1], w:rr[2], h:rr[3]});
-})()`, selector, nth)
+})()`, jsQuote(selector), nth)
 	raw, err := c.Evaluate(js)
 	if err != nil {
 		return 0, 0, err

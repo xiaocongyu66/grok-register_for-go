@@ -65,14 +65,14 @@ func (c *Client) HumanType(text string) error {
 // and clearing the existing value first (form-filling semantics).
 func (c *Client) HumanTypeInto(text, selector string) error {
 	expr := fmt.Sprintf("(function(){ var e = document.querySelector('%s'); if (e) e.focus(); return e; })()",
-		selector)
+		jsQuote(selector))
 	return c.HumanTypeIntoExpr(text, expr, true)
 }
 
 // HumanTypeIntoClear types without clearing (append semantics).
 func (c *Client) HumanTypeAppend(text, selector string) error {
 	expr := fmt.Sprintf("(function(){ var e = document.querySelector('%s'); if (e) e.focus(); return e; })()",
-		selector)
+		jsQuote(selector))
 	return c.HumanTypeIntoExpr(text, expr, false)
 }
 
