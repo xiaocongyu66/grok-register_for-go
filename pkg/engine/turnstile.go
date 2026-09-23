@@ -237,6 +237,10 @@ func solveTurnstileObscura(siteKey, proxy, email string, ua UAProfile) (string, 
 		return "", fmt.Errorf("human click submit: %w", err)
 	}
 
+	// x.ai 在第一次提交后弹确认框(「您正在登录 Grok 使用您的邮箱注册…注册/返回」),
+	// 框里的「注册」才是真正触发 turnstile execute 的动作——真实 Chrome 流是两次点击。
+	// 框由 React 异步渲染,渲染时机不定,放在轮询循环里按时间点重试。
+	dialogClicked := false
 	// 轮询页面自己的 response input(真实流产物),总窗口 50s。
 	for i := 0; i < 100; i++ {
 		r, _ := client.Evaluate(`(function(){
@@ -246,6 +250,49 @@ func solveTurnstileObscura(siteKey, proxy, email string, ua UAProfile) (string, 
 		if len(r) > 20 {
 			fmt.Printf("[ts] obscura token: %s...\n", r[:20])
 			return r, nil
+		}
+		// 诊断:每 10s dump 页面状态(token 没来时看得见卡在哪)。
+		if i%20 == 19 {
+			st, _ := client.Evaluate(`(function(){
+				var cf = Array.from(document.querySelectorAll('script[src]')).filter(function(s){return (s.src||'').includes('challenges.cloudflare')}).length;
+				var res = performance.getEntriesByType('resource').filter(function(e){return e.name.indexOf('challenges.cloudflare')>=0;});
+				var resp = document.querySelector('input[name=cf-turnstile-response]');
+				return JSON.stringify({turnstile: typeof window.turnstile, cfScripts: cf,
+					cfReq: res.length, cfLast: res.length?res[res.length-1].name.slice(0,90):'',
+					respInput: !!resp, widgetIframes: document.querySelectorAll('iframe[id^=cf-chl-widget],iframe[src*=challenges]').length,
+					text: (document.body.innerText||'').replace(/\s+/g,' ').slice(0, 120)});
+			})()`)
+			fmt.Printf("[ts] wait i=%d: %s\n", i, st)
+		}
+		// 确认框里的「注册」:第一次提交后由 React 异步渲染,2s/6s/14s 各找一次。
+		// 只有当位置与表单提交按钮不同(说明确实是新弹的框)才点,且只点一次。
+		if !dialogClicked && (i == 2 || i == 6 || i == 14) {
+			dlg, _ := client.Evaluate(`(function(){
+				var btns = document.querySelectorAll('button,[role=button]');
+				for (var i=0;i<btns.length;i++){
+					var t=(btns[i].textContent||'').toLowerCase().replace(/\s+/g,'');
+					var r=btns[i].getBoundingClientRect();
+					if (r.width>0 && (t==='注册'||t==='signup'||t==='continue'||t==='继续')) {
+						return JSON.stringify({ok:true,x:r.x+r.width/2,y:r.y+r.height/2,text:(btns[i].textContent||'').trim().slice(0,20)});
+					}
+				}
+				return JSON.stringify({ok:false});
+			})()`)
+			if strings.Contains(dlg, `"ok":true`) {
+				var db struct {
+					X    float64 `json:"x"`
+					Y    float64 `json:"y"`
+					Text string  `json:"text"`
+				}
+				if err := json.Unmarshal([]byte(dlg), &db); err == nil {
+					if db.X != ct.X || db.Y != ct.Y {
+						fmt.Printf("[ts] obscura human click dialog confirm '%s' (%.0f, %.0f)\n", db.Text, db.X, db.Y)
+						if err := client.HumanClick(db.X, db.Y); err == nil {
+							dialogClicked = true
+						}
+					}
+				}
+			}
 		}
 		// execute 后 widget 可能弹可见挑战(managed 模式):点 widget 中心辅助。
 		if i == 30 || i == 60 {
