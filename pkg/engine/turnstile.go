@@ -153,9 +153,11 @@ func solveTurnstileObscura(siteKey, proxy, email string, ua UAProfile) (string, 
 		pickJS := `(function(){
 			var els = document.querySelectorAll('button, a, [role=button], div');
 			for (var i=0;i<els.length;i++){
-				var t = (els[i].textContent||'').replace(/\s+/g,'');
+				var t = (els[i].textContent||'').replace(/\s+/g,'').toLowerCase();
 				var r = els[i].getBoundingClientRect();
-				if (r.width > 0 && (t === '使用邮箱注册' || t === 'Sign up with email' || /signupwithemail/i.test(els[i].id||'') || /signupwithemail/i.test(els[i].className||''))) {
+				// 匹配用去空白+小写:英文页 'Sign up with email' 去空白后是
+				// 'signupwithemail',带空格的全等比较永远不匹配(locale 随出口 IP 后必踩)。
+				if (r.width > 0 && (t === '使用邮箱注册' || t === 'signupwithemail' || /signupwithemail/i.test(els[i].id||'') || /signupwithemail/i.test(els[i].className||''))) {
 					els[i].scrollIntoView({block:'center'});
 					var rc = els[i].getBoundingClientRect();
 					return JSON.stringify({ok:true, x: rc.x + rc.width/2, y: rc.y + rc.height/2});
@@ -186,8 +188,8 @@ func solveTurnstileObscura(siteKey, proxy, email string, ua UAProfile) (string, 
 			jsr, _ := client.Evaluate(`(function(){
 				var els = document.querySelectorAll('button, a, [role=button], div');
 				for (var i=0;i<els.length;i++){
-					var t = (els[i].textContent||'').replace(/\s+/g,'');
-					if ((t === '使用邮箱注册' || t === 'Sign up with email') && els[i].getBoundingClientRect().width > 0) {
+					var t = (els[i].textContent||'').replace(/\s+/g,'').toLowerCase();
+					if ((t === '使用邮箱注册' || t === 'signupwithemail') && els[i].getBoundingClientRect().width > 0) {
 						els[i].click();
 						return 'js-clicked';
 					}
